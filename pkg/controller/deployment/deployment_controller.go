@@ -49,6 +49,8 @@ import (
 	"k8s.io/component-base/metrics/prometheus/ratelimiter"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/deployment/util"
+
+	"k8s.io/kubernetes/pkg/util/tenmo"
 )
 
 const (
@@ -72,7 +74,7 @@ type DeploymentController struct {
 	eventRecorder record.EventRecorder
 
 	// To allow injection of syncDeployment for testing.
-	syncHandler func(dKey string) error
+	syncHandler func(dKey string, eid tenmo.ExecutionId) error
 	// used for unit testing
 	enqueueDeployment func(deployment *apps.Deployment)
 
@@ -95,10 +97,13 @@ type DeploymentController struct {
 
 	// Deployments that need to be synced
 	queue workqueue.RateLimitingInterface
+
+	executionId tenmo.ExecutionId
 }
 
 // NewDeploymentController creates a new DeploymentController.
 func NewDeploymentController(dInformer appsinformers.DeploymentInformer, rsInformer appsinformers.ReplicaSetInformer, podInformer coreinformers.PodInformer, client clientset.Interface) (*DeploymentController, error) {
+	println(fmt.Sprintf("TENMO: client %+v", client))
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartStructuredLogging(0)
 	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: client.CoreV1().Events("")})
@@ -147,6 +152,10 @@ func NewDeploymentController(dInformer appsinformers.DeploymentInformer, rsInfor
 
 // Run begins watching and syncing.
 func (dc *DeploymentController) Run(workers int, stopCh <-chan struct{}) {
+	eid, ends := tenmo.ExecutionRegistration(tenmo.Execution{tenmo.ExecIdRand("kube-DeploymentController-Run"), tenmo.None, tenmo.None, tenmo.None, "kube DC Run"})
+	dc.executionId = eid
+	defer ends()
+
 	defer utilruntime.HandleCrash()
 	defer dc.queue.ShutDown()
 
@@ -458,18 +467,23 @@ func (dc *DeploymentController) resolveControllerRef(namespace string, controlle
 // worker runs a worker thread that just dequeues items, processes them, and marks them done.
 // It enforces that the syncHandler is never invoked concurrently with the same key.
 func (dc *DeploymentController) worker() {
-	for dc.processNextWorkItem() {
+	eid, ends := tenmo.ExecutionRegistration(tenmo.Execution{tenmo.ExecIdRand("kube-DeploymentController-worker"), dc.executionId, tenmo.None, tenmo.None, "kube DC worker"})
+	defer ends()
+	for dc.processNextWorkItem(eid) {
 	}
 }
 
-func (dc *DeploymentController) processNextWorkItem() bool {
+func (dc *DeploymentController) processNextWorkItem(workerEId tenmo.ExecutionId) bool {
 	key, quit := dc.queue.Get()
 	if quit {
 		return false
 	}
+	eid, ends := tenmo.ExecutionRegistration(tenmo.Execution{tenmo.ExecIdRand("kube-DeploymentController-worker-processNextWorkItem"), workerEId, tenmo.None, tenmo.None, "kube DC process one"})
+	defer ends()
 	defer dc.queue.Done(key)
 
-	err := dc.syncHandler(key.(string))
+
+	err := dc.syncHandler(key.(string), eid)
 	dc.handleErr(err, key)
 
 	return true
@@ -510,6 +524,7 @@ func (dc *DeploymentController) getReplicaSetsForDeployment(d *apps.Deployment) 
 	deploymentSelector, err := metav1.LabelSelectorAsSelector(d.Spec.Selector)
 	if err != nil {
 		return nil, fmt.Errorf("deployment %s/%s has invalid label selector: %v", d.Namespace, d.Name, err)
+
 	}
 	// If any adoptions are attempted, we should first recheck for deletion with
 	// an uncached quorum read sometime after listing ReplicaSets (see #42639).
@@ -565,7 +580,7 @@ func (dc *DeploymentController) getPodMapForDeployment(d *apps.Deployment, rsLis
 
 // syncDeployment will sync the deployment with the given key.
 // This function is not meant to be invoked concurrently with the same key.
-func (dc *DeploymentController) syncDeployment(key string) error {
+func (dc *DeploymentController) syncDeployment(key string, eid tenmo.ExecutionId) error {
 	startTime := time.Now()
 	klog.V(4).Infof("Started syncing deployment %q (%v)", key, startTime)
 	defer func() {
@@ -577,6 +592,8 @@ func (dc *DeploymentController) syncDeployment(key string) error {
 		return err
 	}
 	deployment, err := dc.dLister.Deployments(namespace).Get(name)
+
+	println(fmt.Sprintf("TENMO: synced deployment %+v", deployment))
 	if errors.IsNotFound(err) {
 		klog.V(2).Infof("Deployment %v has been deleted", key)
 		return nil
@@ -584,6 +601,15 @@ func (dc *DeploymentController) syncDeployment(key string) error {
 	if err != nil {
 		return err
 	}
+
+	desc := fmt.Sprintf("deployment %s", deployment.ObjectMeta.Name)
+	entId, incId := tenmo.IdsEntIncGeneration(deployment.ObjectMeta.SelfLink, deployment.ObjectMeta.Generation)
+	_, _, _ = tenmo.OperationRegistration(tenmo.Operation{
+		eid,
+		tenmo.OpRead,
+		entId,
+		incId,
+		desc, desc})
 
 	// Deep-copy otherwise we are mutating our cache.
 	// TODO: Deep-copy only when needed.

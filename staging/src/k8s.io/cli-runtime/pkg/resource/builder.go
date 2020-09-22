@@ -36,6 +36,7 @@ import (
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/restmapper"
+	"k8s.io/kubernetes/pkg/util/tenmo"
 )
 
 var FileExtensions = []string{".json", ".yaml", ".yml"}
@@ -104,6 +105,9 @@ type Builder struct {
 
 	// fakeClientFn is used for testing
 	fakeClientFn FakeClientFunc
+
+	// Store Tenmo trace id
+	ExecutionId tenmo.ExecutionId
 }
 
 var missingResourceError = fmt.Errorf(`You must provide one or more resources by argument or filename.
@@ -218,9 +222,15 @@ func (b *Builder) FilenameParam(enforceNamespace bool, filenameOptions *Filename
 	}
 	recursive := filenameOptions.Recursive
 	paths := filenameOptions.Filenames
+
 	for _, s := range paths {
+		var incId tenmo.IncarnationId
+		var entId tenmo.EntityId
+		var desc string
 		switch {
 		case s == "-":
+			entId, incId = tenmo.IdsEntIncUlid(fmt.Sprintf("/dev/stdin?pid=%d", os.Getpid()))
+			desc = "kubectl stdin"
 			b.Stdin()
 		case strings.Index(s, "http://") == 0 || strings.Index(s, "https://") == 0:
 			url, err := url.Parse(s)
@@ -228,13 +238,24 @@ func (b *Builder) FilenameParam(enforceNamespace bool, filenameOptions *Filename
 				b.errs = append(b.errs, fmt.Errorf("the URL passed to filename %q is not valid: %v", s, err))
 				continue
 			}
+			entId, incId = tenmo.IdsEntIncUlid(fmt.Sprintf("url://%s", url.String()))
+			desc = "url " + url.String()
 			b.URL(defaultHttpGetAttempts, url)
 		default:
 			if !recursive {
 				b.singleItemImplied = true
 			}
+			// Use mod time instead
+			entId, incId = tenmo.IdsEntIncUlid(fmt.Sprintf("file://%s", s))
+			desc = "file " + s
 			b.Path(recursive, s)
 		}
+		_, _, _ = tenmo.OperationRegistration(tenmo.Operation{
+			b.ExecutionId,
+			tenmo.OpRead,
+			entId,
+			incId,
+			desc, desc})
 	}
 	if filenameOptions.Kustomize != "" {
 		b.paths = append(b.paths, &KustomizeVisitor{filenameOptions.Kustomize,
@@ -956,7 +977,7 @@ func (b *Builder) visitByResource() *Result {
 				return result.withError(fmt.Errorf(errMsg))
 			}
 		}
-
+		println("XXXX: Info from visitByResource")
 		info := &Info{
 			Client:    client,
 			Mapping:   mapping,
@@ -1021,6 +1042,7 @@ func (b *Builder) visitByName() *Result {
 
 	visitors := []Visitor{}
 	for _, name := range b.names {
+		println("XXXX: Info from visitByName")
 		info := &Info{
 			Client:    client,
 			Mapping:   mapping,

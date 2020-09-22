@@ -18,6 +18,7 @@ package resource
 
 import (
 	"context"
+	"net/url"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,6 +74,15 @@ func (m *Helper) WithFieldManager(fieldManager string) *Helper {
 	m.FieldManager = fieldManager
 	return m
 }
+
+func (m *Helper) URL(namespace, name string) *url.URL {
+	req := m.RESTClient.Get().
+		NamespaceIfScoped(namespace, m.NamespaceScoped).
+		Resource(m.Resource).
+		Name(name)
+	return req.URL()
+}
+
 
 func (m *Helper) Get(namespace, name string) (runtime.Object, error) {
 	req := m.RESTClient.Get().

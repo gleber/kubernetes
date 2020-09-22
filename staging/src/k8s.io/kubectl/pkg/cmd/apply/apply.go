@@ -19,6 +19,7 @@ package apply
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
@@ -43,6 +44,7 @@ import (
 	"k8s.io/kubectl/pkg/util/openapi"
 	"k8s.io/kubectl/pkg/util/templates"
 	"k8s.io/kubectl/pkg/validation"
+	"k8s.io/kubernetes/pkg/util/tenmo"
 )
 
 // ApplyOptions defines flags and other configuration parameters for the `apply` command
@@ -103,6 +105,9 @@ type ApplyOptions struct {
 	// Function run after all objects have been applied.
 	// The standard PostProcessorFn is "PrintAndPrunePostProcessor()".
 	PostProcessorFn func() error
+
+	// Store Tenmo trace id
+	ExecutionId tenmo.ExecutionId
 }
 
 var (
@@ -172,6 +177,10 @@ func NewCmdApply(baseName string, f cmdutil.Factory, ioStreams genericclioptions
 		Long:                  applyLong,
 		Example:               applyExample,
 		Run: func(cmd *cobra.Command, args []string) {
+			eid, ends := tenmo.ExecutionRegistration(tenmo.Execution{tenmo.ExecIdRand("kubectl-apply"), tenmo.None, tenmo.None, tenmo.None, "kubectl apply"})
+			o.ExecutionId = eid
+
+			defer ends()
 			cmdutil.CheckErr(o.Complete(f, cmd))
 			cmdutil.CheckErr(validateArgs(cmd, args))
 			cmdutil.CheckErr(validatePruneAll(o.Prune, o.All, o.Selector))
@@ -324,6 +333,9 @@ func (o *ApplyOptions) GetObjects() ([]*resource.Info, error) {
 	if !o.objectsCached {
 		// include the uninitialized objects by default if --prune is true
 		// unless explicitly set --include-uninitialized=false
+		eid, ends := tenmo.ExecutionRegistration(tenmo.Execution{tenmo.ExecIdRand("kubectl-apply-builder"), o.ExecutionId, tenmo.None, tenmo.None, "kubectl apply resource building"})
+		o.Builder.ExecutionId = eid
+		defer ends()
 		r := o.Builder.
 			Unstructured().
 			Schema(o.Validator).
@@ -334,6 +346,18 @@ func (o *ApplyOptions) GetObjects() ([]*resource.Info, error) {
 			Flatten().
 			Do()
 		o.objects, err = r.Infos()
+		for _, o := range o.objects {
+			var re = regexp.MustCompile(`.*/apis/`)
+			resourceSelfLink := re.ReplaceAllString(o.URL().String(), "/apis/")
+			o.Entity, o.Incarnation = tenmo.IdsEntIncUlid(fmt.Sprintf("in-memory-%s", resourceSelfLink));
+			desc := fmt.Sprintf("in-memory resource %s", resourceSelfLink)
+			_, _, _ = tenmo.OperationRegistration(tenmo.Operation{
+				eid,
+				tenmo.OpWrite,
+				o.Entity,
+				o.Incarnation,
+				desc, desc})
+		}
 		o.objectsCached = true
 	}
 	return o.objects, err
@@ -397,6 +421,20 @@ func (o *ApplyOptions) Run() error {
 }
 
 func (o *ApplyOptions) applyOneObject(info *resource.Info) error {
+	println(fmt.Sprintf("applyOneObject for %+v", info))
+	eid, ends := tenmo.ExecutionRegistration(tenmo.Execution{tenmo.ExecIdRand("kubectl-apply-one"), o.ExecutionId, tenmo.None, tenmo.None, "kubectl apply one"})
+	defer ends()
+
+	var re = regexp.MustCompile(`.*/apis/`)
+	resourceSelfLink := re.ReplaceAllString(info.URL().String(), "/apis/")
+	inMemDesc := fmt.Sprintf("in-memory resource %s", resourceSelfLink)
+	_, _, _ = tenmo.OperationRegistration(tenmo.Operation{
+		eid,
+		tenmo.OpRead,
+		info.Entity,
+		info.Incarnation,
+		inMemDesc, inMemDesc})
+
 	o.MarkNamespaceVisited(info)
 
 	if err := o.Recorder.Record(info.Object); err != nil {
@@ -426,6 +464,7 @@ func (o *ApplyOptions) applyOneObject(info *resource.Info) error {
 	}
 
 	if o.ServerSideApply {
+		println("ServerSideApply")
 		// Send the full object to be applied on the server side.
 		data, err := runtime.Encode(unstructured.UnstructuredJSONScheme, info.Object)
 		if err != nil {
@@ -484,6 +523,11 @@ See http://k8s.io/docs/reference/using-api/api-concepts/#conflicts`, err)
 		return nil
 	}
 
+	entId, incId := tenmo.IdsEntIncUlid(resourceSelfLink)
+	desc := fmt.Sprintf("resource %s", info.ObjectName())
+
+	println("non ServerSideApply")
+
 	// Get the modified configuration of the object. Embed the result
 	// as an annotation in the modified configuration, so that it will appear
 	// in the patch sent to the server.
@@ -493,6 +537,14 @@ See http://k8s.io/docs/reference/using-api/api-concepts/#conflicts`, err)
 	}
 
 	if err := info.Get(); err != nil {
+
+		_, _, _ = tenmo.OperationRegistration(tenmo.Operation{
+			eid,
+			tenmo.OpRead,
+			entId,
+			incId,
+			desc, desc})
+
 		if !errors.IsNotFound(err) {
 			return cmdutil.AddSourceToErr(fmt.Sprintf("retrieving current configuration of:\n%s\nfrom server for:", info.String()), info.Source, err)
 		}
@@ -506,6 +558,14 @@ See http://k8s.io/docs/reference/using-api/api-concepts/#conflicts`, err)
 		if o.DryRunStrategy != cmdutil.DryRunClient {
 			// Then create the resource and skip the three-way merge
 			obj, err := helper.Create(info.Namespace, true, info.Object)
+			incId := tenmo.IncIdUlid(resourceSelfLink)
+			_, _, _ = tenmo.OperationRegistration(tenmo.Operation{
+				eid,
+				tenmo.OpWrite,
+				entId,
+				incId,
+				desc, desc})
+
 			if err != nil {
 				return cmdutil.AddSourceToErr("creating", info.Source, err)
 			}
@@ -551,6 +611,14 @@ See http://k8s.io/docs/reference/using-api/api-concepts/#conflicts`, err)
 		}
 
 		info.Refresh(patchedObject, true)
+
+		incId := tenmo.IncIdUlid(resourceSelfLink)
+		_, _, _ = tenmo.OperationRegistration(tenmo.Operation{
+			eid,
+			tenmo.OpWrite,
+			entId,
+			incId,
+			desc, desc})
 
 		if string(patchBytes) == "{}" && !o.shouldPrintObject() {
 			printer, err := o.ToPrinter("unchanged")

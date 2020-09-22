@@ -43,6 +43,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/cli-runtime/pkg/kustomize"
+
+	"k8s.io/kubernetes/pkg/util/tenmo"
 )
 
 const (
@@ -88,11 +90,18 @@ type Info struct {
 	// but if set it should be equal to or newer than the resource version of the
 	// object (however the server defines resource version).
 	ResourceVersion string
+
+	Entity tenmo.EntityId
+	Incarnation tenmo.IncarnationId
 }
 
 // Visit implements Visitor
 func (i *Info) Visit(fn VisitorFunc) error {
 	return fn(i, nil)
+}
+
+func (i *Info) URL() *url.URL {
+	return NewHelper(i.Client, i.Mapping).URL(i.Namespace, i.Name)
 }
 
 // Get retrieves the object from the Namespace and Name fields
@@ -587,6 +596,7 @@ func (v *StreamVisitor) Visit(fn VisitorFunc) error {
 		if err := ValidateSchema(ext.Raw, v.Schema); err != nil {
 			return fmt.Errorf("error validating %q: %v", v.Source, err)
 		}
+		println(fmt.Sprintf("Visit: >%s<", v.Source))
 		info, err := v.infoForData(ext.Raw, v.Source)
 		if err != nil {
 			if fnErr := fn(info, err); fnErr != nil {

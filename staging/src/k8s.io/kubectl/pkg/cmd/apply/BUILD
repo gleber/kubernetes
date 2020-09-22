@@ -46,6 +46,7 @@ go_library(
         "//vendor/k8s.io/klog/v2:go_default_library",
         "//vendor/k8s.io/kube-openapi/pkg/util/proto:go_default_library",
         "//vendor/sigs.k8s.io/yaml:go_default_library",
+        "//vendor/k8s.io/kubernetes/pkg/util/tenmo:go_default_library",
     ],
 )
 
